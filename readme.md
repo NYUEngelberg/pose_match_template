@@ -87,7 +87,7 @@ This model works because deployment effectively happens in two stages.  During t
 
 Pose Match can be deployed online or in your institution's physical location.  In both cases, users will interact with a webcam and monitor attached to a computer (see [minimum requirements](#minimum-requirements)).
 
-You can make your version of Pose Match available for free using a combination of github and cloudflare pages.  
+You can make your version of Pose Match available for free using a combination of github and cloudflare pages (see [Deployment Phase](#deployment-phase)).  
 
 ### Minimum Requirements
 
