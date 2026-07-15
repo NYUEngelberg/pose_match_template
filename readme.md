@@ -46,7 +46,7 @@ Pose Match is browser based.  That means you can make it available as part of yo
 
 ## Privacy
 >[!NOTE]
->All image processing for Pose Match happens locally. User images are not saved or sent to any third parties.  In fact, you can run a basic version of Pose Match without any internet connection at all (although you will need some sort of server to allow users to visit the object pages for more information). 
+>All image processing for Pose Match happens locally. User images are not saved or sent to any third parties.  In fact, you can run a basic version of Pose Match without any internet connection at all — the pose-detection model and all JavaScript libraries ship with the code in `libs/`, so the page makes no external requests (although you will need some sort of server to allow users to visit the object pages for more information). 
 
 ## Does Pose Match use AI?
 
@@ -114,7 +114,7 @@ You will use a series of python scripts to prepare and import your data. They ca
 
 #### Step 1: /image_cleaner
 
-`person_or_not.py` is the utility to take a bunch of arbitrary images, determine if they contain people, and save metadata including pose information.  It uses tensorflow to identify keypoints for poses and cosine distances to describe the relationship between those points.  Before running, you may need to install some libraries (depending on your platform you may want to do this in a virtual environment):
+`person_or_not.py` is the utility to take a bunch of arbitrary images, determine if they contain people, and save images and metadata (including pose information) for ones that do contain people.  It uses tensorflow to identify keypoints for poses and cosine distances to describe the relationship between those points.  Before running, you may need to install some libraries (depending on your platform you may want to do this in a virtual environment):
 
 ```bash
 pip install numpy tensorflow tensorflow-hub Pillow
@@ -203,4 +203,5 @@ Finally, as we started developing this project, many (many, many) people respond
 
 # Licensing
 
-Add code and instructions are released under an MIT License. Images are in the public domain. The GLAM-E Lab logo and branding is not openly licensed.  
+Add code and instructions are released under an MIT License. Images are in the public domain. The GLAM-E Lab and Engelberg Center logo and branding is not openly licensed.  
+

@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+venv/
+
+# Pipeline working files (regenerated each run — see utilities/image_cleaner)
+utilities/image_cleaner/input_images/
+utilities/image_cleaner/processed_images/

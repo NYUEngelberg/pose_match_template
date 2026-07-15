@@ -103,8 +103,12 @@ let imageCacheOrder = [];  // filenames, most recently used last
 const KEYPOINT_FLIP_MAP = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15];
 
 function preload() {
-  // Load the bodyPose model
-  bodyPose = ml5.bodyPose();
+  // Load the bodyPose model from the locally hosted copy in libs/ so the
+  // exhibit runs fully offline — without modelUrl, ml5 would download the
+  // model weights from Google's servers on every page load
+  bodyPose = ml5.bodyPose("MoveNet", {
+    modelUrl: "libs/movenet-multipose-lightning-1/model.json"
+  });
 
   // Load the pre-computed pose data for all reference images
   referencePoseData = loadJSON("input_image_metadata.json");
