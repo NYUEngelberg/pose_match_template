@@ -87,7 +87,7 @@ This model works because deployment effectively happens in two stages.  During t
 
 Pose Match can be deployed online or in your institution's physical location.  In both cases, users will interact with a webcam and monitor attached to a computer (see [minimum requirements](#minimum-requirements)).
 
-You can make your version of Pose Match available for free using a combination of github and cloudflare pages (see [Deployment Phase](#deployment-phase)).  
+You can make your version of Pose Match available for free using a combination of github and cloudflare pages.  
 
 ### Minimum Requirements
 
@@ -95,7 +95,7 @@ Pose Match is lightweight to operate and runs in the browser.  It will run on an
 
 1. Webcam (no meaningful minimum for the resolution)
 2. Monitor
-3. Computer with or without wifi
+3. Computer (client will run on a Raspberry Pi)
 4. A server running Pose Match (may be the same as the computer running the user interaction)
 5. Metadata about the objects in your collection
 6. Images of objects in your collection
@@ -201,3 +201,6 @@ The Google Creative Lab documented [their own version of this project in 2018](h
 
 Finally, as we started developing this project, many (many, many) people responded with a variation of "oh like [Strike a Pose at the Cleveland Museum of Art](https://www.clevelandart.org/artlens-gallery/artlens-gallery-first-iteration-gallery-one)?".  The only answer to that is "yes, a lot like that!".  
 
+# Licensing
+
+Add code and instructions are released under an MIT License. Images are in the public domain. The GLAM-E Lab logo and branding is not openly licensed.  
