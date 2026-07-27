@@ -4,7 +4,9 @@
 
 ![screenshot of Pose Match with a user on the left side of the screen and a matched image on the right. The user has reference points marked with green dots on their eyes and shoulders, with red lines connecting the dots](/readme_images/pose-match-screenshot.png)
 
-Welcome to Pose Match, a project from the [GLAM-E Lab](https://www.glamelab.org/).  This repo will guide you through the process of setting up Pose Match using your own open access collection.  This can be done for free using publicly available resources.  If you want to get started, jump down to the [Getting Started](#getting-started) section.  If you want more background on the project, read on below.
+Welcome to Pose Match, a project from the [GLAM-E Lab](https://www.glamelab.org/).  It allows visitors to explore works in a GLAM collection by striking a pose to find matching images.
+
+This repo will guide you through the process of setting up Pose Match using your own open access collection.  This can be done for free using publicly available resources.  If you want to get started, jump down to the [Getting Started](#getting-started) section.  If you want more background on the project, read on below.
 
 The process involves three simple steps:
 
@@ -73,7 +75,7 @@ This overview section explains some of the architecture and elements of Pose Mat
 
 The simplest version of Pose Match runs as a website on a publicly accessible server.  That server includes a collection of open access images and a json file that contains metadata about the images.  The metadata includes traditional metadata that your institution has about objects in its collection (title, artist, medium, etc.).  It also contains metadata about the poses represented in the work. You will create that metadata before you deploy Pose Match using the scripts in this repo.
 
-When a user engages with Pose Match, the ml5.js library identifies key points of the user (nose, left eye, right knee, etc.), draws those points on the screen, and uses cosine distance to calculate a mathematical relationship between the points.  It then searches the json file for an object with points that closely match that mathematical relationship (the smallest cosine distance).  This match is displayed next to the live video image of the user.
+When a user engages with Pose Match in front of the camera, the ml5.js library identifies key points of the user (nose, left eye, right knee, etc.), draws those points on the screen, and uses cosine distance to calculate a mathematical relationship between the points.  It then searches the json file for an object with points that closely match that mathematical relationship (the smallest cosine distance).  This match is displayed next to the live video image of the user.
 
 Clicking on the matching image or scanning the QR code sends the user to an `/info` page.  The url for that page includes an identifier for the work (for example, `https://pose-match.pages.dev/info?id=SSsaam_1973.164` includes the id `SSsaam_1973.164`).  When a user visits `/info?id=IDENTIFIER`, the identifier is passed to the page and matched to the json file.  The info page then loads the relevant metadata onto the info page.  
 
@@ -93,12 +95,11 @@ You can make your version of Pose Match available for free using a combination o
 
 Pose Match is lightweight to operate and runs in the browser.  It will run on any modern laptop, as well as a inexpensive computer such as a raspberry pi.  You will need:
 
-1. Webcam (no meaningful minimum for the resolution)
-2. Monitor
-3. Computer (client will run on a Raspberry Pi)
-4. A server running Pose Match (may be the same as the computer running the user interaction)
-5. Metadata about the objects in your collection
-6. Images of objects in your collection
+1. Webcam to capture the user (no meaningful minimum for the resolution)
+2. Monitor so the user can see themselves
+3. Computer to run the system 
+4. Metadata about the objects in your collection
+5. Images of objects in your collection
 
 
 ## Deployment
@@ -114,7 +115,7 @@ You will use a series of python scripts to prepare and import your data. They ca
 
 #### Step 1: /image_cleaner
 
-`person_or_not.py` is the utility to take a bunch of arbitrary images, determine if they contain people, and save images and metadata (including pose information) for ones that do contain people.  It uses tensorflow to identify keypoints for poses and cosine distances to describe the relationship between those points.  Before running, you may need to install some libraries (depending on your platform you may want to do this in a virtual environment):
+`person_or_not.py` is the utility to take a bunch of arbitrary images, determine if they contain people, and save images and metadata (including pose information) for ones that do contain people.  The non-people images are discarded. It uses tensorflow to identify keypoints for poses and cosine distances to describe the relationship between those points.  Before running, you may need to install some libraries (depending on your platform you may want to do this in a virtual environment):
 
 ```bash
 pip install numpy tensorflow tensorflow-hub Pillow
@@ -159,7 +160,7 @@ This script runs in two modes:
 
 Set the mode on line 16 of the script.
 
-When you run the script it will prompt you for a 2 character source code.  This code will be added to the file identifier and name.  The purpose of the source code is to avoid namespace collisions.  For example, if you import an image called `12345.jpg` from one collection and a different `12345.jpg` from a different collection, the unique character code appended to the different collections will mean that instead of two `12345.jpg` files, you have `AA12345.jpg` and `BB12345.jpg`.
+When you run the script it will prompt you for a 2 character source code.  This code will be added to the file identifier and name.  The purpose of the source code is to avoid namespace collisions.  For example, if you import an image called `12345.jpg` from one collection with the code `AA` and a different `12345.jpg` from a different collection with the source code `BB`, the unique character code appended to the different collections will mean that instead of two `12345.jpg` files, you have `AA12345.jpg` and `BB12345.jpg`.
 
 If you are just importing one set of images, it does not really matter what you choose. However, if you are importing multiple set of images, pick a unique code that will help you identify the source of each set. This can also be helpful if you ever need to track down the source of a file directly.  
 
