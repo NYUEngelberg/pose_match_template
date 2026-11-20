@@ -38,7 +38,7 @@ The premise of Pose Match is simple - a user strikes a pose and is matched to an
 
 A user can click on the matched image or scan the QR code to find out more information about the matched image.
 
-![screenshot of more information screen with an image of the matched work above metadata including name, artist, date medium, department, and repository](/readme_images/more-info-screenshot.png%20.png)
+![screenshot of more information screen with an image of the matched work above metadata including name, artist, date medium, department, and repository](/readme_images/more-info-screenshot.png)
 
 Depending on the metadata you have in your collection, this page can include information about the work, where it can be found in your institution, as well as other information.
 

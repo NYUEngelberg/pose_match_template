@@ -31,6 +31,13 @@ let referenceList = null;      // Pre-processed reference poses (built on first 
 let qrCode = null;
 let currentQRObjectId = null;  // Track what QR is currently showing
 
+// Where QR codes send a visitor's phone. Leave "" to link to wherever this
+// page is served from (right for any public deployment). Set it to a public
+// URL ending in "/" only when this copy is served from an address phones
+// can't reach, such as an offline kiosk at http://localhost — the public
+// site must then serve the same dataset.
+const QR_BASE_URL = "";
+
 // Accessibility: debounce timer for screen reader announcements
 let announceTimeout = null;
 const ANNOUNCE_DELAY_MS = 1500;  // Wait 1.5 seconds of stable match before announcing
@@ -38,6 +45,8 @@ const ANNOUNCE_DELAY_MS = 1500;  // Wait 1.5 seconds of stable match before anno
 // Camera status
 let cameraReady = false;
 let cameraError = false;
+let cameraErrorTitle = "";   // shown in place of the webcam feed
+let cameraErrorDetail = "";
 
 // Webcam crop parameters (set during draw, used to map skeleton keypoints)
 let cropSx = 0, cropSy = 0, cropSw = 640, cropSh = 480;
@@ -70,13 +79,17 @@ const MATCH_SAMPLE_TOP_K = 40;       // cap on the candidate pool per pick
 // Instead of penalizing images immediately, wait a minimum display time
 // so the user can see each match before it rotates away.
 let matchStartTime = 0;        // When the current match first appeared
-let previousPoseVector = null;  // Previous frame's pose vector for movement detection
-// Minimum time (ms) to show each image before it can be penalized away.
-// When standing still, images stay longer; when moving, they rotate faster.
-const EXPLORE_MIN_DISPLAY_STILL_MS = 5000;   // 5 seconds when not moving
-const EXPLORE_MIN_DISPLAY_MOVING_MS = 1000;  // 1 second when actively moving
-// Cosine similarity between consecutive pose vectors above this threshold
-// means the person is standing still (vectors are nearly identical).
+let matchPoseVector = null;    // The visitor's pose at the moment the current match was chosen
+// Minimum time (ms) to show each image before it can be replaced.
+// While the visitor holds the pose that produced the current image, it stays
+// longer; once their pose has changed, it can be replaced quickly.
+const EXPLORE_MIN_DISPLAY_STILL_MS = 5000;   // 5 seconds while holding the same pose
+const EXPLORE_MIN_DISPLAY_MOVING_MS = 1000;  // 1 second once the pose has changed
+// Cosine similarity between the visitor's current pose and their pose when
+// the on-screen image was chosen. Below this, the pose counts as changed.
+// (Comparing against the previous frame instead would treat someone who
+// strikes a new pose and freezes as "still", and make them wait the full
+// still time to see the match for it.)
 const MOVEMENT_THRESHOLD = 0.98;
 
 // Keypoints below this confidence are ignored for matching and drawing —
@@ -95,6 +108,17 @@ let lastPoseSeenTime = 0;
 // Uncapped, a kiosk running all day grows without bound and crashes the tab.
 const IMAGE_CACHE_MAX = 40;
 let imageCacheOrder = [];  // filenames, most recently used last
+// Matching runs several times a second, far faster than an image loads, so
+// track requests in flight (to avoid re-requesting the same file every tick)
+// and recent failures (so a missing file isn't retried forever or re-picked).
+let imageLoading = {};     // filename -> true while its request is in flight
+let imageFailedAt = {};    // filename -> millis() when its load last failed
+const IMAGE_RETRY_MS = 60000;  // leave a failed image alone for this long
+
+// If loading hasn't finished after this long, say so instead of showing
+// "Loading..." indefinitely (the model is ~9MB, so allow for slow connections)
+const LOAD_WATCHDOG_MS = 45000;
+let loadWatchdog = null;
 
 // Maps each keypoint to its horizontal mirror (left/right swapped) in the
 // MoveNet keypoint order. Used to also match against mirrored reference
@@ -102,7 +126,17 @@ let imageCacheOrder = [];  // filenames, most recently used last
 // arm raised — this effectively doubles the pose coverage of the dataset.
 const KEYPOINT_FLIP_MAP = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15];
 
+// Replace the loading placeholder's text (it is removed once setup() runs)
+function showLoadMessage(message) {
+  let loadingMsg = document.getElementById('loading-message');
+  if (loadingMsg) loadingMsg.textContent = message;
+}
+
 function preload() {
+  loadWatchdog = setTimeout(function() {
+    showLoadMessage("This is taking longer than expected. Check your connection and reload the page.");
+  }, LOAD_WATCHDOG_MS);
+
   // Load the bodyPose model from the locally hosted copy in libs/ so the
   // exhibit runs fully offline — without modelUrl, ml5 would download the
   // model weights from Google's servers on every page load
@@ -111,11 +145,15 @@ function preload() {
   });
 
   // Load the pre-computed pose data for all reference images
-  referencePoseData = loadJSON("input_image_metadata.json");
+  referencePoseData = loadJSON("input_image_metadata.json", function() {}, function() {
+    clearTimeout(loadWatchdog);
+    showLoadMessage("Could not load the artwork collection. Reload the page to try again.");
+  });
 }
 
 function setup() {
   // Remove loading placeholder
+  clearTimeout(loadWatchdog);
   let loadingMsg = document.getElementById('loading-message');
   if (loadingMsg) loadingMsg.remove();
 
@@ -129,36 +167,61 @@ function setup() {
   // Get the skeleton connection information
   connections = bodyPose.getSkeleton();
 
-  // Set up webcam with error handling
-  video = createCapture(VIDEO, function() {
-    // Camera access granted
-    cameraReady = true;
-    // Start continuous pose detection on webcam
-    bodyPose.detectStart(video, gotWebcamPoses);
-  });
-  video.size(640, 480);
-  video.hide();
+  startCamera();
 
-  // Handle camera permission denied
-  video.elt.addEventListener('error', function() {
-    cameraError = true;
-  });
-
-  // Also check via getUserMedia for permission denied
-  navigator.mediaDevices.getUserMedia({ video: true })
-    .catch(function(err) {
-      cameraError = true;
-      console.log('Camera access denied:', err.name);
-    });
-
-  // Initialize QR code (empty initially)
+  // Initialize QR code (empty initially). Generated larger than it is shown
+  // so it stays sharp when the canvas is scaled up; CSS sets its on-screen size
   qrCode = new QRCode(document.getElementById("qrcode"), {
-    width: 80,
-    height: 80,
+    width: 240,
+    height: 240,
     colorDark: "#000000",
     colorLight: "#ffffff"
   });
 
+}
+
+// Set up the webcam. p5's createCapture logs a failed camera request to the
+// console and nothing else, so first ask for the camera directly to learn
+// whether (and why) it is unavailable. That probe stream is released before
+// createCapture opens its own — leaving it open would hold the camera twice.
+function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showCameraError("Camera unavailable",
+      "This page can only use the camera\nover https or on localhost");
+    return;
+  }
+  navigator.mediaDevices.getUserMedia({ video: true })
+    .then(function(probeStream) {
+      probeStream.getTracks().forEach(track => track.stop());
+      video = createCapture(VIDEO, function() {
+        cameraReady = true;
+        // Start continuous pose detection on webcam
+        bodyPose.detectStart(video, gotWebcamPoses);
+      });
+      video.size(640, 480);
+      video.hide();
+    })
+    .catch(function(err) {
+      console.log('Camera unavailable:', err.name, err.message);
+      if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+        showCameraError("Camera access denied",
+          "Please allow camera access\nto use Pose Match");
+      } else if (err.name === 'NotFoundError' || err.name === 'OverconstrainedError') {
+        showCameraError("No camera found",
+          "Connect a camera and reload the page");
+      } else if (err.name === 'NotReadableError' || err.name === 'AbortError') {
+        showCameraError("Camera unavailable",
+          "Another app may be using the camera.\nClose it and reload the page");
+      } else {
+        showCameraError("Camera unavailable", "Reload the page to try again");
+      }
+    });
+}
+
+function showCameraError(title, detail) {
+  cameraError = true;
+  cameraErrorTitle = title;
+  cameraErrorDetail = detail;
 }
 
 function draw() {
@@ -174,7 +237,7 @@ function draw() {
   if (recentMatches.length > 0 && lastPoseSeenTime > 0 &&
       currentTime - lastPoseSeenTime > IDLE_RESET_MS) {
     recentMatches = [];
-    previousPoseVector = null;
+    matchPoseVector = null;
   }
 
   // Draw webcam on the left side (or error message if camera denied)
@@ -186,10 +249,10 @@ function draw() {
     fill(255);
     textAlign(CENTER, CENTER);
     textSize(18);
-    text("Camera access denied", 200, 270);
+    text(cameraErrorTitle, 200, 270);
     textSize(14);
     fill(180);
-    text("Please allow camera access\nto use Pose Match", 200, 320);
+    text(cameraErrorDetail, 200, 320);
   } else if (video) {
     // Crop-to-fit: scale webcam to fill area, clipping overflow (like object-fit: cover)
     let vidRatio = video.width / video.height;
@@ -280,21 +343,97 @@ function draw() {
 
   // Draw label for the image actually on screen (not one still loading)
   if (displayedMatchData) {
-    fill(255);
-    noStroke();
-    textAlign(CENTER, TOP);
-
-    // Display title
-    textSize(14);
-    let title = displayedMatchData.metadata.title || '';
-    text(title, 410, 10, 380, 40);
-
-    // Display artist (smaller, below title)
-    textSize(12);
-    fill(200);  // Slightly dimmer
-    let artist = displayedMatchData.metadata.artist || '';
-    text(artist, 410, 55, 380, 30);
+    drawMatchLabel(displayedMatchData);
   }
+}
+
+// Label layout (canvas units). The label sits on a dark translucent band so
+// it stays readable over light artworks.
+const LABEL_MAX_WIDTH = 376;       // text width within the 400px artwork half
+const LABEL_TITLE_SIZE = 14;
+const LABEL_TITLE_LEADING = 18;
+const LABEL_TITLE_MAX_LINES = 2;   // longer titles end in an ellipsis
+const LABEL_ARTIST_SIZE = 12;
+const LABEL_PADDING = 8;
+let labelLayout = null;            // wrapped lines for the match on screen
+let labelLayoutFor = null;         // the match labelLayout was built for
+
+// Draw the title and artist of the matched artwork across the top of the
+// artwork half. The artist line is left out when the dataset has none.
+function drawMatchLabel(match) {
+  if (labelLayoutFor !== match) {
+    textSize(LABEL_TITLE_SIZE);
+    let titleLines = wrapLabelText(match.metadata.title || '', LABEL_MAX_WIDTH, LABEL_TITLE_MAX_LINES);
+    textSize(LABEL_ARTIST_SIZE);
+    let artistLines = wrapLabelText(match.metadata.artist || '', LABEL_MAX_WIDTH, 1);
+    labelLayout = { titleLines: titleLines, artist: artistLines[0] || '' };
+    labelLayoutFor = match;
+  }
+  let titleLines = labelLayout.titleLines;
+  let artist = labelLayout.artist;
+  if (titleLines.length === 0 && !artist) {
+    return;
+  }
+
+  let titleHeight = titleLines.length * LABEL_TITLE_LEADING;
+  let artistHeight = artist ? LABEL_ARTIST_SIZE + 6 : 0;
+  let bandHeight = LABEL_PADDING + titleHeight + artistHeight + LABEL_PADDING;
+
+  noStroke();
+  fill(0, 0, 0, 185);
+  rect(400, 0, 400, bandHeight);
+
+  textAlign(CENTER, TOP);
+  fill(255);
+  textSize(LABEL_TITLE_SIZE);
+  for (let i = 0; i < titleLines.length; i++) {
+    text(titleLines[i], 600, LABEL_PADDING + i * LABEL_TITLE_LEADING);
+  }
+  if (artist) {
+    fill(210);
+    textSize(LABEL_ARTIST_SIZE);
+    text(artist, 600, LABEL_PADDING + titleHeight + 2);
+  }
+}
+
+// Word-wrap a string to at most maxLines lines of maxWidth, measured at the
+// current textSize. Text that doesn't fit ends in an ellipsis.
+function wrapLabelText(str, maxWidth, maxLines) {
+  let words = String(str).trim().split(/\s+/).filter(w => w.length > 0);
+  let lines = [];
+  let line = '';
+  let i = 0;
+  while (i < words.length) {
+    let candidate = line ? line + ' ' + words[i] : words[i];
+    if (textWidth(candidate) <= maxWidth || !line) {
+      // fits — or it is a single word too long for any line, which is kept
+      // whole here and cut to fit below
+      line = candidate;
+      i++;
+    } else if (lines.length === maxLines - 1) {
+      break;  // out of lines with words left over
+    } else {
+      lines.push(line);
+      line = '';
+    }
+  }
+  if (line) {
+    lines.push(line);
+  }
+  let truncated = i < words.length;
+  for (let n = 0; n < lines.length; n++) {
+    let isLast = n === lines.length - 1;
+    let needsEllipsis = isLast && truncated;
+    if (!needsEllipsis && textWidth(lines[n]) <= maxWidth) {
+      continue;
+    }
+    let cut = lines[n];
+    while (cut.length > 1 && textWidth(cut + '\u2026') > maxWidth) {
+      cut = cut.slice(0, -1).trimEnd();
+    }
+    lines[n] = cut + '\u2026';
+  }
+  return lines;
 }
 
 // Callback for continuous webcam pose detection
@@ -389,6 +528,15 @@ function findBestMatch() {
   for (let i = 0; i < referenceList.length; i++) {
     let entry = referenceList[i];
 
+    // Skip artworks whose image recently failed to load
+    let failedAt = imageFailedAt[entry.data.filename];
+    if (failedAt !== undefined) {
+      if (millis() - failedAt < IMAGE_RETRY_MS) {
+        continue;
+      }
+      delete imageFailedAt[entry.data.filename];
+    }
+
     // Compare against the artwork's pose and its mirror image, over only
     // the keypoints both sides are confident about
     let similarity = Math.max(
@@ -444,10 +592,12 @@ function findBestMatch() {
     if (matchChanged) {
       // A different image wants to win — only allow the switch if the current image
       // has been shown for the minimum display time. This prevents rapid cycling when
-      // the pose naturally fluctuates between a few similar images.
-      let isMoving = previousPoseVector !== null &&
-        cosineSimilarity(webcamProcessed.l2Vector, previousPoseVector) < MOVEMENT_THRESHOLD;
-      let minDisplay = isMoving ? EXPLORE_MIN_DISPLAY_MOVING_MS : EXPLORE_MIN_DISPLAY_STILL_MS;
+      // the pose naturally fluctuates between a few similar images. The minimum is
+      // short once the visitor has left the pose that produced the current image,
+      // so a newly struck pose gets its match promptly, in either mode.
+      let poseChanged = matchPoseVector !== null &&
+        cosineSimilarity(webcamProcessed.l2Vector, matchPoseVector) < MOVEMENT_THRESHOLD;
+      let minDisplay = poseChanged ? EXPLORE_MIN_DISPLAY_MOVING_MS : EXPLORE_MIN_DISPLAY_STILL_MS;
 
       if (bestMatchData === null || millis() - matchStartTime >= minDisplay) {
         // Allowed to switch — penalize the outgoing image now that we're done with it
@@ -464,12 +614,10 @@ function findBestMatch() {
         }
         matchStartTime = millis();
         bestMatchData = bestData;
+        matchPoseVector = webcamProcessed.l2Vector;
       }
       // else: minimum display time not yet elapsed — keep showing the current match
     }
-
-    // Store current pose vector for next frame's movement detection
-    previousPoseVector = webcamProcessed.l2Vector;
 
     // Swap in the image — and only once it's actually visible, update the
     // label/QR/announcement via displayedMatchData, so they never describe
@@ -482,8 +630,10 @@ function findBestMatch() {
         displayedMatchData = bestMatchData;
         updateQRCode(displayedMatchData.object_id);
       }
-    } else {
+    } else if (!imageLoading[filename]) {
+      imageLoading[filename] = true;
       loadImage("input_images/" + filename, function(img) {
+        delete imageLoading[filename];
         imageCache[filename] = img;
         touchImageCache(filename);
         // Only swap in if this is still the match we're switching to
@@ -491,6 +641,17 @@ function findBestMatch() {
           bestMatchImg = img;
           displayedMatchData = bestMatchData;
           updateQRCode(displayedMatchData.object_id);
+        }
+      }, function() {
+        // Missing or unreadable image: stop waiting on it. Fall back to the
+        // image still on screen so the next matching pass can pick another
+        // artwork right away (this one is skipped for IMAGE_RETRY_MS).
+        delete imageLoading[filename];
+        imageFailedAt[filename] = millis();
+        console.log('Could not load image:', filename);
+        if (bestMatchData && bestMatchData.filename === filename) {
+          bestMatchData = displayedMatchData;
+          matchStartTime = 0;
         }
       });
     }
@@ -657,14 +818,23 @@ function cosineSimilarity(vectorA, vectorB) {
   return dotProduct;
 }
 
+// Build the info page URL for an artwork. The id is URL-encoded because
+// object_ids can contain spaces and other characters — phone scanners cut a
+// link off at a space. baseUrl must end in "/"; omit it to link to wherever
+// this page is served from.
+function infoPageUrl(objectId, baseUrl) {
+  let base = baseUrl || window.location.href.replace(/[?#].*$/, '').replace(/[^/]*$/, '');
+  return base + 'info.html?id=' + encodeURIComponent(objectId);
+}
+
 // Update the QR code when the match changes
 function updateQRCode(objectId) {
   if (qrCode && objectId !== currentQRObjectId) {
     currentQRObjectId = objectId;
-    // Build the URL for the info page
-    let infoUrl = window.location.href.replace(/[^/]*$/, '') + 'info.html?id=' + objectId;
     qrCode.clear();
-    qrCode.makeCode(infoUrl);
+    qrCode.makeCode(infoPageUrl(objectId, QR_BASE_URL));
+    // The QR box stays hidden until there is a code to show
+    document.getElementById("qrcode").style.display = "block";
 
     // Debounced screen reader announcement - only announce after match is stable for a period of time (avoids a barrage of announcements)
     if (announceTimeout) {
@@ -694,8 +864,7 @@ function mousePressed() {
   // Only respond to clicks on the right side (matched image area)
   if (mouseX > 400 && mouseX < 800 && mouseY > 0 && mouseY < 593) {
     if (displayedMatchData) {
-      let infoUrl = window.location.href.replace(/[^/]*$/, '') + 'info.html?id=' + displayedMatchData.object_id;
-      window.open(infoUrl, '_blank');
+      window.open(infoPageUrl(displayedMatchData.object_id), '_blank');
     }
   }
 }

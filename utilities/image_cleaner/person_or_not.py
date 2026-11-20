@@ -173,14 +173,23 @@ def detect_pose(movenet, image_path):
         keypoints_with_scores = outputs['output_0'].numpy()[0, 0, :, :]
 
         # Convert to our keypoint format (matching ml5.js structure)
-        # MoveNet returns [y, x, confidence] normalized to 0-1
+        # MoveNet returns [y, x, confidence] normalized to 0-1 of the padded
+        # 192x192 SQUARE it was given (resize_with_pad letterboxes the image),
+        # not of the original image. The square's side corresponds to the
+        # image's longer edge, so both axes scale by that same length, and
+        # the padding added to the shorter axis is subtracted. Scaling x by
+        # width and y by height instead would squash every pose by the
+        # image's aspect ratio.
+        padded_size = max(original_width, original_height)
+        pad_x = (padded_size - original_width) / 2
+        pad_y = (padded_size - original_height) / 2
         keypoints = []
         for i, name in enumerate(KEYPOINT_NAMES):
             y, x, confidence = keypoints_with_scores[i]
             keypoints.append({
                 'name': name,
-                'x': float(x * original_width),   # Scale to original image dimensions
-                'y': float(y * original_height),
+                'x': float(x * padded_size - pad_x),   # original image pixels
+                'y': float(y * padded_size - pad_y),
                 'confidence': float(confidence)
             })
 
@@ -292,8 +301,11 @@ def process_all_images():
             # Process pose to get L2 vector
             pose_data = process_pose(keypoints)
 
-            # Save a web-sized copy to the output folder
-            output_path = os.path.join(OUTPUT_IMAGES_FOLDER, filename)
+            # Save a web-sized copy to the output folder. The copy is always
+            # JPEG data, so it always gets a .jpg name — a PNG input keeps its
+            # object_id but must not keep its .png extension
+            output_filename = object_id + ".jpg"
+            output_path = os.path.join(OUTPUT_IMAGES_FOLDER, output_filename)
             save_resized_image(image_path, output_path)
 
             # Get metadata for this image
@@ -302,7 +314,7 @@ def process_all_images():
             # Create output record with metadata and pose data
             output_record = {
                 'object_id': object_id,
-                'filename': filename,
+                'filename': output_filename,
                 'l2_vector': pose_data['l2_vector'],
                 # Per-keypoint confidences (same order as KEYPOINT_NAMES) so
                 # the matcher can ignore vector dimensions where the artwork's
