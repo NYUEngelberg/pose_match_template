@@ -115,6 +115,10 @@
         font-size: 14px;
         z-index: 10;
       }
+      /* Kiosk mode (KIOSK_MODE in sketch.js): nothing leads off this page */
+      body.kiosk #about-link {
+        display: none;
+      }
       #about-link:hover {
         background: var(--brand-overlay-bg-hover, white);
       }

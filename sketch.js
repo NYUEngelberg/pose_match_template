@@ -38,6 +38,15 @@ let currentQRObjectId = null;  // Track what QR is currently showing
 // site must then serve the same dataset.
 const QR_BASE_URL = "";
 
+// Kiosk mode, for an unattended exhibit running in a full-screen browser
+// with no tabs, address bar or back button. Set to true and nothing on the
+// page leads away from it: clicking the artwork does nothing, the About link
+// is hidden, and the logo and footer links are inert. (Any of those would
+// open a page or tab the visitor has no way to close, and an offline kiosk
+// can't load the outside ones at all.) Visitors still get to the artwork's
+// info page on their own phone through the QR code.
+const KIOSK_MODE = false;
+
 // Accessibility: debounce timer for screen reader announcements
 let announceTimeout = null;
 const ANNOUNCE_DELAY_MS = 1500;  // Wait 1.5 seconds of stable match before announcing
@@ -59,7 +68,7 @@ let exploreMode = true;
 let recentMatches = [];
 // How many recently shown images to remember and exclude from matching.
 // Once an image falls off this list, it can be shown again.
-// Sized close to the dataset (~1300 images) so a long session cycles
+// Sized close to the dataset (~1200 images) so a long session cycles
 // through most of the collection before repeating.
 // Recent images are excluded outright rather than score-penalized: for
 // distinctive poses the dataset has only a few close matches and similarity
@@ -75,11 +84,21 @@ const EXPLORE_HISTORY_SIZE = 400;
 const MATCH_SAMPLE_EPSILON = 0.015;  // candidates within this of the best score
 const MATCH_SAMPLE_TOP_K = 40;       // cap on the candidate pool per pick
 
+// Explore mode never shows an image scoring more than this far below the
+// best match for the visitor's current pose. For common poses hundreds of
+// images clear that floor, so it never comes into play; for a distinctive
+// pose only a few dozen do, and without a floor explore would work through
+// those and then slide into poor matches. Once every image above the floor
+// has been shown, explore cycles back through them, least recently shown
+// first, instead of going lower.
+const EXPLORE_SIMILARITY_FLOOR = 0.05;
+
 // Movement-aware timing for explore mode:
 // Instead of penalizing images immediately, wait a minimum display time
 // so the user can see each match before it rotates away.
 let matchStartTime = 0;        // When the current match first appeared
 let matchPoseVector = null;    // The visitor's pose at the moment the current match was chosen
+let matchPoseMask = null;      // ...and which of its keypoints were confident
 // Minimum time (ms) to show each image before it can be replaced.
 // While the visitor holds the pose that produced the current image, it stays
 // longer; once their pose has changed, it can be replaced quickly.
@@ -90,6 +109,10 @@ const EXPLORE_MIN_DISPLAY_MOVING_MS = 1000;  // 1 second once the pose has chang
 // (Comparing against the previous frame instead would treat someone who
 // strikes a new pose and freezes as "still", and make them wait the full
 // still time to see the match for it.)
+// Only keypoints confident in both poses are compared. The model's guesses
+// for joints it can't see jump around even on a motionless person — with
+// legs out of frame that noise alone used up most of the margin below — and
+// they dilute real movement of the joints that are visible.
 const MOVEMENT_THRESHOLD = 0.98;
 
 // Keypoints below this confidence are ignored for matching and drawing —
@@ -99,10 +122,29 @@ const KEYPOINT_CONFIDENCE_MIN = 0.1;
 // Fewer means the pose vector is mostly noise (person half out of frame).
 const MIN_CONFIDENT_KEYPOINTS = 8;
 
-// Clear the explore history after this long with nobody in frame, so each
+// Attract mode: what the exhibit shows when nobody is using it. It is on
+// from page load, and comes back once nobody has been matchable for
+// ATTRACT_AFTER_MS — long enough for a departing visitor to scan the QR code
+// of their last match. While it is on, the artwork half shows a slideshow of
+// random artworks (with their usual label and QR code) and the webcam half
+// shows ATTRACT_PROMPT. It ends the moment a person with enough confident
+// keypoints appears. Entering it also clears the explore history, so each
 // new visitor starts fresh with the collection's best matches available.
-const IDLE_RESET_MS = 30000;
-let lastPoseSeenTime = 0;
+const ATTRACT_AFTER_MS = 30000;
+const ATTRACT_SLIDE_MS = 6000;      // how long each slideshow artwork stays up
+const ATTRACT_PROMPT = "Step in and strike a pose";
+let attractMode = true;
+let attractNextSlideTime = 0;       // millis() when the slideshow next advances
+let lastMatchableTime = null;       // millis() when a matchable pose was last seen
+
+// When someone is in view but too few of their keypoints are confident to
+// match (usually standing too close), say so instead of silently doing
+// nothing. Needs at least TOO_CLOSE_MIN_KEYPOINTS so that a stray detection
+// on an empty scene doesn't trigger it, for TOO_CLOSE_HINT_AFTER_MS.
+const TOO_CLOSE_HINT = "Step back so we can see all of you";
+const TOO_CLOSE_MIN_KEYPOINTS = 4;
+const TOO_CLOSE_HINT_AFTER_MS = 1000;
+let tooFewKeypointsSince = null;
 
 // Cap on decoded images kept in memory (evicted least-recently-used).
 // Uncapped, a kiosk running all day grows without bound and crashes the tab.
@@ -131,6 +173,22 @@ function showLoadMessage(message) {
   let loadingMsg = document.getElementById('loading-message');
   if (loadingMsg) loadingMsg.textContent = message;
 }
+
+// Debug overlay: add ?debug=1 to the page URL to show, live, how the
+// "has the pose changed?" check is behaving — see drawDebugOverlay().
+// Low-confidence keypoints are also drawn (orange rings) so you can see
+// where the model is placing joints it can't actually see.
+const DEBUG = new URLSearchParams(window.location.search).get('debug') === '1';
+const DEBUG_WINDOW_MS = 5000;  // "low" figures cover this much recent history
+let debugStats = null;         // latest figures, refreshed on every matching pass
+let debugHistory = [];         // recent {time, all, masked} similarity samples
+let debugHistoryFor = null;    // the matchPoseVector debugHistory was measured against
+// Debug recording: every matching pass is logged in memory. Press a number
+// key (1-9) to label what you are testing from then on, and D to download
+// the whole log as a CSV file.
+let debugLog = [];
+let debugLabel = "";
+const DEBUG_LOG_MAX = 50000;   // rows (about 3.5 hours at 4 per second)
 
 function preload() {
   loadWatchdog = setTimeout(function() {
@@ -162,7 +220,19 @@ function setup() {
   canvas.parent('canvas-container');
 
   // Accessibility: add aria-label to canvas
-  canvas.elt.setAttribute('aria-label', 'Pose matching experience: your webcam feed on the left detects your pose, matched artwork appears on the right. Click the artwork or scan the QR code to learn more.');
+  canvas.elt.setAttribute('aria-label', 'Pose matching experience: your webcam feed on the left detects your pose, matched artwork appears on the right. ' +
+    (KIOSK_MODE ? 'Scan the QR code to learn more.' : 'Click the artwork or scan the QR code to learn more.'));
+
+  if (KIOSK_MODE) {
+    // The "kiosk" class hides the About link (see index.html). Every other
+    // link on the page (logo, footer) loses its destination and becomes
+    // plain text. setup() runs after branding.js has wrapped the logo.
+    document.body.classList.add('kiosk');
+    for (let link of document.querySelectorAll('a')) {
+      link.removeAttribute('href');
+      link.removeAttribute('target');
+    }
+  }
 
   // Get the skeleton connection information
   connections = bodyPose.getSkeleton();
@@ -232,13 +302,7 @@ function draw() {
     lastMatchTime = currentTime;
   }
 
-  // Nobody in frame for a while: clear the explore history so the next
-  // visitor starts fresh, with the collection's best matches available
-  if (recentMatches.length > 0 && lastPoseSeenTime > 0 &&
-      currentTime - lastPoseSeenTime > IDLE_RESET_MS) {
-    recentMatches = [];
-    matchPoseVector = null;
-  }
+  updateAttractMode(currentTime);
 
   // Draw webcam on the left side (or error message if camera denied)
   if (cameraError) {
@@ -312,9 +376,17 @@ function draw() {
         fill(0, 255, 0);
         noStroke();
         circle(mapX(keypoint.x), mapY(keypoint.y), 10);
+      } else if (DEBUG) {
+        // Where the model guesses a joint it can't see
+        noFill();
+        stroke(255, 160, 0);
+        strokeWeight(2);
+        circle(mapX(keypoint.x), mapY(keypoint.y), 10);
       }
     }
   }
+
+  drawWebcamPrompt(currentTime);
 
   // Draw the best matching image on the right side (preserve aspect ratio)
   if (bestMatchImg) {
@@ -345,6 +417,116 @@ function draw() {
   if (displayedMatchData) {
     drawMatchLabel(displayedMatchData);
   }
+
+  if (DEBUG) {
+    drawDebugOverlay();
+  }
+}
+
+// Record the figures the debug overlay shows. Called on every matching pass
+// with the visitor's processed pose (null when too few keypoints are
+// confident to attempt a match).
+function updateDebugStats(webcamProcessed) {
+  let now = millis();
+  debugStats = {
+    time: now,
+    confident: primaryPose
+      ? primaryPose.keypoints.filter(kp => kp.confidence > KEYPOINT_CONFIDENCE_MIN).length
+      : 0,
+    usable: webcamProcessed !== null,
+    all: null,
+    masked: null,
+    matchScore: null,       // similarity of the image on screen to the pose now
+    bestScore: null,        // best similarity available for the pose now
+    aboveFloor: null,       // explore: images within the floor of the best
+    freshAboveFloor: null,  // ...of which not shown recently or on screen
+    pick: ""                // explore: fresh / recycled / hold
+  };
+  if (debugHistoryFor !== matchPoseVector) {
+    debugHistory = [];  // a new match was chosen — the comparison pose changed
+    debugHistoryFor = matchPoseVector;
+  }
+  if (webcamProcessed !== null && matchPoseVector !== null) {
+    measureDebugSimilarity(webcamProcessed, now);
+  }
+}
+
+// Append the finished matching pass to the debug recording
+function logDebugRow() {
+  if (debugLog.length >= DEBUG_LOG_MAX) {
+    return;
+  }
+  let number = (value, places) => (value === null || !isFinite(value)) ? "" : value.toFixed(places);
+  debugLog.push([
+    Math.round(debugStats.time), debugLabel, debugStats.confident, debugStats.usable ? 1 : 0,
+    number(debugStats.all, 4), number(debugStats.masked, 4),
+    Math.round(millis() - matchStartTime), exploreMode ? "explore" : "best",
+    bestMatchData ? bestMatchData.object_id : "",
+    number(debugStats.matchScore, 4), number(debugStats.bestScore, 4),
+    number(debugStats.aboveFloor, 0), number(debugStats.freshAboveFloor, 0), debugStats.pick
+  ].concat(primaryPose ? primaryPose.keypoints.map(kp => kp.confidence.toFixed(2)) : []));
+}
+
+function measureDebugSimilarity(webcamProcessed, now) {
+  // What the matcher uses: only joints confident both now and at match time
+  debugStats.masked = similarityToMatchPose(webcamProcessed);
+  // For comparison: every joint, including ones the model can't see
+  debugStats.all = cosineSimilarity(webcamProcessed.l2Vector, matchPoseVector);
+  debugHistory.push({ time: now, all: debugStats.all, masked: debugStats.masked });
+  while (debugHistory.length > 0 && now - debugHistory[0].time > DEBUG_WINDOW_MS) {
+    debugHistory.shift();
+  }
+}
+
+// Draw the debug panel over the bottom of the webcam half
+function drawDebugOverlay() {
+  let lines = ["DEBUG  keys: 1-9 label test, D download log",
+    "recording: " + debugLog.length + " samples, label: " + (debugLabel || "(none)")];
+  if (!primaryPose || !debugStats || millis() - debugStats.time > 1000) {
+    lines.push("no person detected" + (attractMode ? "  (attract mode)" : ""));
+  } else {
+    lines.push("confident keypoints: " + debugStats.confident + " of 17" +
+      (debugStats.usable ? "" : "  - too few to match (need " + MIN_CONFIDENT_KEYPOINTS + ")"));
+    if (debugStats.all === null) {
+      lines.push("no image chosen yet for this pose");
+    } else {
+      let lowAll = Math.min(...debugHistory.map(sample => sample.all));
+      let lowMasked = Math.min(...debugHistory.map(sample => sample.masked));
+      let verdict = value => value < MOVEMENT_THRESHOLD ? "CHANGED" : "same";
+      lines.push("similarity to your pose when this image was chosen");
+      lines.push("(below " + MOVEMENT_THRESHOLD + " = pose counts as changed)");
+      lines.push("                    now     low " + (DEBUG_WINDOW_MS / 1000) + "s   pose");
+      lines.push("visible joints(used)" + debugStats.masked.toFixed(3) + "   " + lowMasked.toFixed(3) + "    " + verdict(debugStats.masked));
+      lines.push("all joints (old)    " + debugStats.all.toFixed(3) + "   " + lowAll.toFixed(3) + "    " + verdict(debugStats.all));
+      let minDisplay = debugStats.masked < MOVEMENT_THRESHOLD ? EXPLORE_MIN_DISPLAY_MOVING_MS : EXPLORE_MIN_DISPLAY_STILL_MS;
+      lines.push("image shown " + ((millis() - matchStartTime) / 1000).toFixed(1) + "s, can change after " +
+        (minDisplay / 1000).toFixed(1) + "s  (" + (exploreMode ? "explore" : "best match") + ")");
+    }
+    if (debugStats.bestScore !== null && isFinite(debugStats.bestScore)) {
+      lines.push("match score: this image " +
+        (debugStats.matchScore === null ? "-" : debugStats.matchScore.toFixed(3)) +
+        ", best available " + debugStats.bestScore.toFixed(3));
+      if (debugStats.aboveFloor !== null) {
+        lines.push("within " + EXPLORE_SIMILARITY_FLOOR + " of best: " + debugStats.aboveFloor +
+          " images, " + debugStats.freshAboveFloor + " unseen  (next: " + debugStats.pick + ")");
+      }
+    }
+  }
+
+  let lineHeight = 14;
+  let boxHeight = lines.length * lineHeight + 12;
+  push();
+  noStroke();
+  fill(0, 0, 0, 190);
+  rect(0, 593 - boxHeight, 400, boxHeight);
+  fill(255);
+  textFont('monospace');
+  textSize(11);
+  textAlign(LEFT, TOP);
+  for (let i = 0; i < lines.length; i++) {
+    text(lines[i], 8, 593 - boxHeight + 6 + i * lineHeight);
+  }
+  pop();
 }
 
 // Label layout (canvas units). The label sits on a dark translucent band so
@@ -440,9 +622,89 @@ function wrapLabelText(str, maxWidth, maxLines) {
 function gotWebcamPoses(results) {
   webcamPoses = results;
   primaryPose = selectPrimaryPose(results);
-  if (primaryPose) {
-    lastPoseSeenTime = millis();
+}
+
+// Enter attract mode when nobody has been matchable for a while, and run its
+// slideshow. (Leaving it happens in runMatchingPass, when a matchable pose
+// appears.)
+function updateAttractMode(now) {
+  if (!attractMode && lastMatchableTime !== null && now - lastMatchableTime > ATTRACT_AFTER_MS) {
+    attractMode = true;
+    attractNextSlideTime = now;
+    // The next visitor starts fresh
+    recentMatches = [];
+    matchPoseVector = null;
+    // Tell screen reader users once, rather than announcing every slide
+    if (announceTimeout) {
+      clearTimeout(announceTimeout);
+    }
+    let announcement = document.getElementById('match-announcement');
+    if (announcement) {
+      announcement.textContent = ATTRACT_PROMPT;
+    }
   }
+  if (attractMode && now >= attractNextSlideTime && referencePoseData !== null) {
+    attractNextSlideTime = now + ATTRACT_SLIDE_MS;
+    showAttractSlide();
+  }
+}
+
+// Put a random artwork on the artwork half
+function showAttractSlide() {
+  if (referenceList === null) {
+    buildReferenceList();
+  }
+  let current = bestMatchData ? bestMatchData.filename : null;
+  let choices = referenceList.filter(entry =>
+    entry.data.filename !== current && imageFailedAt[entry.data.filename] === undefined);
+  if (choices.length === 0) {
+    return;
+  }
+  bestMatchData = choices[Math.floor(Math.random() * choices.length)].data;
+  matchStartTime = millis();
+  showCurrentMatch();
+}
+
+// Draw a prompt across the webcam half: the too-close hint when someone is
+// in view but can't be matched, otherwise the attract prompt in attract mode.
+function drawWebcamPrompt(now) {
+  let confident = primaryPose
+    ? primaryPose.keypoints.filter(kp => kp.confidence > KEYPOINT_CONFIDENCE_MIN).length
+    : 0;
+  if (confident >= TOO_CLOSE_MIN_KEYPOINTS && confident < MIN_CONFIDENT_KEYPOINTS) {
+    if (tooFewKeypointsSince === null) {
+      tooFewKeypointsSince = now;
+    }
+  } else {
+    tooFewKeypointsSince = null;
+  }
+
+  let message = null;
+  if (tooFewKeypointsSince !== null && now - tooFewKeypointsSince >= TOO_CLOSE_HINT_AFTER_MS) {
+    message = TOO_CLOSE_HINT;
+  } else if (attractMode) {
+    message = ATTRACT_PROMPT;
+  }
+  if (message === null || cameraError) {
+    return;
+  }
+
+  push();
+  textStyle(BOLD);
+  textSize(22);
+  let lines = wrapLabelText(message, 368, 3);
+  let leading = 28;
+  let bandHeight = lines.length * leading + 24;
+  let bandTop = (593 - bandHeight) / 2;
+  noStroke();
+  fill(0, 0, 0, 185);
+  rect(0, bandTop, 400, bandHeight);
+  fill(255);
+  textAlign(CENTER, TOP);
+  for (let i = 0; i < lines.length; i++) {
+    text(lines[i], 200, bandTop + 12 + i * leading + 3);
+  }
+  pop();
 }
 
 // With multiple people in frame, match the one taking up the most space
@@ -502,8 +764,17 @@ function flipPoseVector(vector) {
   return flipped;
 }
 
-// Find the reference pose that best matches the webcam pose
+// Run one matching pass (and, in debug mode, record it)
 function findBestMatch() {
+  let statsBefore = debugStats;
+  runMatchingPass();
+  if (DEBUG && debugStats !== statsBefore) {
+    logDebugRow();
+  }
+}
+
+// Find the reference pose that best matches the webcam pose
+function runMatchingPass() {
   // Need webcam pose and reference poses to compare
   if (primaryPose === null || referencePoseData === null) {
     return;
@@ -511,8 +782,21 @@ function findBestMatch() {
 
   // Process the webcam pose
   let webcamProcessed = processPose(primaryPose);
+  if (DEBUG) {
+    updateDebugStats(webcamProcessed);
+  }
   if (webcamProcessed === null) {
     return;
+  }
+
+  lastMatchableTime = millis();
+  if (attractMode) {
+    // Someone is here. Forget the slideshow artwork as the "current match"
+    // so their first match appears at once, without the minimum display
+    // time, and the slide isn't counted as an image they were shown. (It
+    // stays on screen until that first match has loaded.)
+    attractMode = false;
+    bestMatchData = null;
   }
 
   if (referenceList === null) {
@@ -521,8 +805,8 @@ function findBestMatch() {
 
   let bestSimilarity = -Infinity;
   let bestData = null;
-  let bestEligibleSimilarity = -Infinity;
-  let eligible = [];  // explore mode: candidates not shown recently
+  let onScreenSimilarity = null;  // how well the image on screen fits the pose now
+  let candidates = [];  // explore mode: every image except the one on screen
 
   // Loop through all reference poses and find the best match
   for (let i = 0; i < referenceList.length; i++) {
@@ -553,36 +837,61 @@ function findBestMatch() {
 
     // In explore mode, recently shown images are ineligible — only fresh
     // images compete. This is what guarantees variety: for distinctive poses
-    // the few close matches would otherwise win every rotation.
-    if (exploreMode && recentMatches.indexOf(entry.data.filename) === -1) {
-      eligible.push({ similarity: similarity, reference: entry.data });
-      if (similarity > bestEligibleSimilarity) {
-        bestEligibleSimilarity = similarity;
-      }
+    // the few close matches would otherwise win every rotation. The image
+    // on screen is ineligible too: it only joins recentMatches when it is
+    // replaced, so if it could compete, a pose with one clear best match
+    // would hold that image indefinitely.
+    let isOnScreen = bestMatchData !== null && entry.data.filename === bestMatchData.filename;
+    if (isOnScreen) {
+      onScreenSimilarity = similarity;
+    } else if (exploreMode) {
+      candidates.push({
+        similarity: similarity,
+        reference: entry.data,
+        recentIndex: recentMatches.indexOf(entry.data.filename)  // -1 = not shown recently
+      });
     }
   }
 
-  // In explore mode, pick randomly among the near-tie eligible candidates
-  // rather than always taking the single best. The min-display gate below
-  // still controls when the displayed image is actually allowed to rotate.
-  if (exploreMode && eligible.length > 0) {
-    let band = eligible.filter(c => c.similarity >= bestEligibleSimilarity - MATCH_SAMPLE_EPSILON);
-    // Don't re-pick the image already on screen if there's any alternative
-    if (band.length > 1 && bestMatchData) {
-      let withoutCurrent = band.filter(c => c.reference.filename !== bestMatchData.filename);
-      if (withoutCurrent.length > 0) {
-        band = withoutCurrent;
+  if (exploreMode) {
+    // Only images within EXPLORE_SIMILARITY_FLOOR of the best match compete
+    let aboveFloor = candidates.filter(c => c.similarity >= bestSimilarity - EXPLORE_SIMILARITY_FLOOR);
+    let fresh = aboveFloor.filter(c => c.recentIndex === -1);
+    let pick = "hold";
+    if (fresh.length > 0) {
+      // Pick randomly among the near-tie fresh candidates rather than always
+      // taking the single best. The min-display gate below still controls
+      // when the displayed image is actually allowed to rotate.
+      let bestFresh = Math.max(...fresh.map(c => c.similarity));
+      let band = fresh.filter(c => c.similarity >= bestFresh - MATCH_SAMPLE_EPSILON);
+      band.sort((a, b) => b.similarity - a.similarity);
+      if (band.length > MATCH_SAMPLE_TOP_K) {
+        band.length = MATCH_SAMPLE_TOP_K;
       }
-    }
-    band.sort((a, b) => b.similarity - a.similarity);
-    if (band.length > MATCH_SAMPLE_TOP_K) {
-      band.length = MATCH_SAMPLE_TOP_K;
-    }
-    // band can be empty if every similarity was NaN (degenerate pose where
-    // no keypoint cleared the confidence threshold) — keep the current match
-    if (band.length > 0) {
       bestData = band[Math.floor(Math.random() * band.length)].reference;
+      pick = "fresh";
+    } else if (aboveFloor.length > 0) {
+      // Every image above the floor has been shown: go back to the one
+      // shown longest ago rather than dropping to a poor match
+      let oldest = aboveFloor.reduce((a, b) => (b.recentIndex < a.recentIndex ? b : a));
+      bestData = oldest.reference;
+      pick = "recycled";
+    } else if (bestMatchData !== null) {
+      // Nothing but the image on screen clears the floor (or the pose was
+      // degenerate and nothing could be scored) — keep showing it
+      bestData = bestMatchData;
     }
+    if (DEBUG) {
+      let onScreenAbove = onScreenSimilarity !== null &&
+        onScreenSimilarity >= bestSimilarity - EXPLORE_SIMILARITY_FLOOR ? 1 : 0;
+      debugStats.aboveFloor = aboveFloor.length + onScreenAbove;
+      debugStats.freshAboveFloor = fresh.length;
+      debugStats.pick = pick;
+    }
+  }
+  if (DEBUG) {
+    debugStats.matchScore = onScreenSimilarity;
+    debugStats.bestScore = bestSimilarity;
   }
 
   // If we found a match, update the display
@@ -596,11 +905,17 @@ function findBestMatch() {
       // short once the visitor has left the pose that produced the current image,
       // so a newly struck pose gets its match promptly, in either mode.
       let poseChanged = matchPoseVector !== null &&
-        cosineSimilarity(webcamProcessed.l2Vector, matchPoseVector) < MOVEMENT_THRESHOLD;
+        similarityToMatchPose(webcamProcessed) < MOVEMENT_THRESHOLD;
       let minDisplay = poseChanged ? EXPLORE_MIN_DISPLAY_MOVING_MS : EXPLORE_MIN_DISPLAY_STILL_MS;
 
       if (bestMatchData === null || millis() - matchStartTime >= minDisplay) {
-        // Allowed to switch — penalize the outgoing image now that we're done with it
+        // Allowed to switch. An image coming back from the recent list leaves
+        // it while on screen (it rejoins at the end when it is replaced)
+        let incomingIndex = recentMatches.indexOf(bestData.filename);
+        if (incomingIndex !== -1) {
+          recentMatches.splice(incomingIndex, 1);
+        }
+        // Penalize the outgoing image now that we're done with it
         if (exploreMode && bestMatchData &&
             recentMatches.indexOf(bestMatchData.filename) === -1) {
           recentMatches.push(bestMatchData.filename);
@@ -615,47 +930,68 @@ function findBestMatch() {
         matchStartTime = millis();
         bestMatchData = bestData;
         matchPoseVector = webcamProcessed.l2Vector;
+        matchPoseMask = webcamProcessed.keypointMask;
       }
       // else: minimum display time not yet elapsed — keep showing the current match
     }
 
-    // Swap in the image — and only once it's actually visible, update the
-    // label/QR/announcement via displayedMatchData, so they never describe
-    // an image that hasn't loaded yet
-    let filename = bestMatchData.filename;
-    if (imageCache[filename]) {
-      bestMatchImg = imageCache[filename];
+    showCurrentMatch();
+  }
+}
+
+// Show bestMatchData on the artwork half, loading its image if needed.
+function showCurrentMatch() {
+  if (bestMatchData === null) {
+    return;
+  }
+  // Swap in the image — and only once it's actually visible, update the
+  // label/QR/announcement via displayedMatchData, so they never describe
+  // an image that hasn't loaded yet
+  let filename = bestMatchData.filename;
+  if (imageCache[filename]) {
+    bestMatchImg = imageCache[filename];
+    touchImageCache(filename);
+    if (displayedMatchData !== bestMatchData) {
+      displayedMatchData = bestMatchData;
+      updateQRCode(displayedMatchData.object_id);
+    }
+  } else if (!imageLoading[filename]) {
+    imageLoading[filename] = true;
+    loadImage("input_images/" + filename, function(img) {
+      delete imageLoading[filename];
+      imageCache[filename] = img;
       touchImageCache(filename);
-      if (displayedMatchData !== bestMatchData) {
+      // Only swap in if this is still the match we're switching to
+      if (bestMatchData && bestMatchData.filename === filename) {
+        bestMatchImg = img;
         displayedMatchData = bestMatchData;
         updateQRCode(displayedMatchData.object_id);
       }
-    } else if (!imageLoading[filename]) {
-      imageLoading[filename] = true;
-      loadImage("input_images/" + filename, function(img) {
-        delete imageLoading[filename];
-        imageCache[filename] = img;
-        touchImageCache(filename);
-        // Only swap in if this is still the match we're switching to
-        if (bestMatchData && bestMatchData.filename === filename) {
-          bestMatchImg = img;
-          displayedMatchData = bestMatchData;
-          updateQRCode(displayedMatchData.object_id);
-        }
-      }, function() {
-        // Missing or unreadable image: stop waiting on it. Fall back to the
-        // image still on screen so the next matching pass can pick another
-        // artwork right away (this one is skipped for IMAGE_RETRY_MS).
-        delete imageLoading[filename];
-        imageFailedAt[filename] = millis();
-        console.log('Could not load image:', filename);
-        if (bestMatchData && bestMatchData.filename === filename) {
-          bestMatchData = displayedMatchData;
-          matchStartTime = 0;
-        }
-      });
-    }
+    }, function() {
+      // Missing or unreadable image: stop waiting on it. Fall back to the
+      // image still on screen so the next matching pass can pick another
+      // artwork right away (this one is skipped for IMAGE_RETRY_MS).
+      delete imageLoading[filename];
+      imageFailedAt[filename] = millis();
+      console.log('Could not load image:', filename);
+      if (bestMatchData && bestMatchData.filename === filename) {
+        bestMatchData = displayedMatchData;
+        matchStartTime = 0;
+        // in attract mode, try another slide shortly (not instantly — if every
+        // image is failing, that would fire off requests as fast as they fail)
+        attractNextSlideTime = millis() + 1000;
+      }
+    });
   }
+}
+
+// Similarity between the visitor's current pose and their pose when the
+// on-screen image was chosen, over the keypoints confident in both.
+// Only call when matchPoseVector is set.
+function similarityToMatchPose(webcamProcessed) {
+  return maskedCosineSimilarity(
+    webcamProcessed.l2Vector, matchPoseVector,
+    webcamProcessed.keypointMask, matchPoseMask.map(confident => confident ? 1 : 0));
 }
 
 // Mark an image as recently used and evict the least-recently-used images
@@ -840,24 +1176,48 @@ function updateQRCode(objectId) {
     if (announceTimeout) {
       clearTimeout(announceTimeout);
     }
-    announceTimeout = setTimeout(announceMatch, ANNOUNCE_DELAY_MS);
+    if (!attractMode) {
+      announceTimeout = setTimeout(announceMatch, ANNOUNCE_DELAY_MS);
+    }
   }
 }
 
 // Announce the current match to screen readers
 function announceMatch() {
   let announcement = document.getElementById('match-announcement');
-  if (announcement && displayedMatchData) {
+  if (announcement && displayedMatchData && !attractMode) {
     let title = displayedMatchData.metadata.title || 'Untitled';
     let artist = displayedMatchData.metadata.artist || 'Unknown artist';
     announcement.textContent = 'Matched artwork: ' + title + ' by ' + artist;
   }
 }
 
+// Debug recording keys (only with ?debug=1): 1-9 label, D download
+function keyPressed() {
+  if (!DEBUG) {
+    return;
+  }
+  if (key >= '1' && key <= '9') {
+    debugLabel = key;
+  } else if (key === 'd' || key === 'D') {
+    let header = ["ms", "label", "confident_keypoints", "usable", "similarity_all_joints",
+      "similarity_hidden_masked", "ms_image_shown", "mode", "match_object_id",
+      "match_score", "best_score", "above_floor", "unseen_above_floor", "next_pick"]
+      .concat(KEYPOINT_FLIP_MAP.map((_, i) => "conf_" + i));
+    let quote = value => '"' + String(value).replace(/"/g, '""') + '"';
+    let csv = [header].concat(debugLog).map(row => row.map(quote).join(",")).join("\n");
+    let link = document.createElement("a");
+    link.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    link.download = "pose-match-debug.csv";
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }
+}
+
 // Click on matched image to open info page
 function mousePressed() {
   // Only respond to left-clicks (allow right-click context menu)
-  if (mouseButton !== LEFT) {
+  if (mouseButton !== LEFT || KIOSK_MODE) {
     return;
   }
 

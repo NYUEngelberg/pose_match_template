@@ -1,6 +1,12 @@
 """
 Batch process images to identify those with detectable human poses.
-Uses TensorFlow MoveNet (same model as ml5.js) for consistency.
+
+Uses MoveNet MultiPose Lightning, the same model the web page runs on the
+visitor's webcam (via ml5.js), and prepares each image the same way the page
+does. That matters: the stored pose for an artwork should be what the page's
+own model would see in it. (An earlier version used MoveNet SinglePose here;
+the two models disagree often enough that an artwork was the best match for
+its own pose only about half the time.)
 
 Outputs:
 - /processed_images/ folder with filtered images
@@ -9,6 +15,7 @@ Outputs:
 
 import os
 import json
+import math
 import numpy as np
 import tensorflow as tf
 import tensorflow_hub as hub
@@ -37,8 +44,15 @@ MIN_CONFIDENT_KEYPOINTS = 10
 # Confidence threshold for individual keypoints
 KEYPOINT_CONFIDENCE_THRESHOLD = 0.1
 
-# MoveNet model URL (SinglePose Lightning - same as ml5.js default)
-MOVENET_MODEL_URL = "https://tfhub.dev/google/movenet/singlepose/lightning/4"
+# MoveNet model URL (MultiPose Lightning v1 - the model sketch.js loads from
+# libs/movenet-multipose-lightning-1/)
+MOVENET_MODEL_URL = "https://tfhub.dev/google/movenet/multipose/lightning/1"
+# The web page's pose library (ml5.js / TensorFlow.js pose-detection) shrinks
+# each frame so its longer side is this many pixels, and ignores any detected
+# person scoring below MIN_POSE_SCORE. Both are that library's defaults; keep
+# them in step with it so this script sees what the page sees.
+MODEL_MAX_DIMENSION = 256
+MIN_POSE_SCORE = 0.25
 
 # MoveNet keypoint names (same order as ml5.js)
 KEYPOINT_NAMES = [
@@ -144,60 +158,92 @@ def load_model():
 
 
 def load_and_preprocess_image(image_path):
-    """Load and preprocess image for MoveNet (expects 192x192 for Lightning)."""
-    # Load image
+    """Load an image and prepare it for MoveNet MultiPose exactly as the web
+    page's pose library does: shrink it so the longer side is
+    MODEL_MAX_DIMENSION, then pad the bottom or right edge with black up to
+    the next multiple of 32 (the model needs both sides to be multiples of 32).
+
+    Returns the model input and the sizes needed to map keypoints back to
+    the original image.
+    """
     image = tf.io.read_file(image_path)
     image = tf.image.decode_jpeg(image, channels=3)
+    original_height = int(tf.shape(image)[0])
+    original_width = int(tf.shape(image)[1])
 
-    # Store original dimensions for scaling keypoints back
-    original_height = tf.shape(image)[0]
-    original_width = tf.shape(image)[1]
+    # int(x + 0.5) rounds halves up, like JavaScript's Math.round
+    if original_width > original_height:
+        resized_width = MODEL_MAX_DIMENSION
+        resized_height = max(1, int(MODEL_MAX_DIMENSION * original_height / original_width + 0.5))
+    else:
+        resized_height = MODEL_MAX_DIMENSION
+        resized_width = max(1, int(MODEL_MAX_DIMENSION * original_width / original_height + 0.5))
+    padded_height = 32 * math.ceil(resized_height / 32)
+    padded_width = 32 * math.ceil(resized_width / 32)
 
-    # Resize to 192x192 (MoveNet Lightning input size)
-    image = tf.image.resize_with_pad(image, 192, 192)
-    image = tf.cast(image, dtype=tf.int32)
+    # Plain bilinear resize with the same pixel alignment TensorFlow.js uses
+    resized = tf.compat.v1.image.resize_bilinear(
+        tf.expand_dims(tf.cast(image, tf.float32), axis=0),
+        [resized_height, resized_width],
+        align_corners=False, half_pixel_centers=False)
+    padded = tf.pad(resized, [[0, 0],
+                              [0, padded_height - resized_height],
+                              [0, padded_width - resized_width],
+                              [0, 0]])
+    input_image = tf.cast(padded, dtype=tf.int32)
 
-    # Add batch dimension: model expects shape [1, 192, 192, 3] not [192, 192, 3]
-    input_image = tf.expand_dims(image, axis=0)
-
-    return input_image, int(original_width), int(original_height)
+    sizes = {
+        'original_width': original_width, 'original_height': original_height,
+        'resized_width': resized_width, 'resized_height': resized_height,
+        'padded_width': padded_width, 'padded_height': padded_height,
+    }
+    return input_image, sizes
 
 
 def detect_pose(movenet, image_path):
-    """Run pose detection on an image and return keypoints."""
-    try:
-        input_image, original_width, original_height = load_and_preprocess_image(image_path)
+    """Run pose detection on an image and return the keypoints of the person
+    the web page would match against, or None if it finds nobody.
 
-        # Run inference
-        outputs = movenet(input_image)
-        keypoints_with_scores = outputs['output_0'].numpy()[0, 0, :, :]
+    MoveNet MultiPose reports up to 6 people. Like the page, this ignores
+    anyone scoring below MIN_POSE_SCORE and then takes whoever occupies the
+    most space (largest bounding box around their confident keypoints).
+    """
+    input_image, sizes = load_and_preprocess_image(image_path)
 
-        # Convert to our keypoint format (matching ml5.js structure)
-        # MoveNet returns [y, x, confidence] normalized to 0-1 of the padded
-        # 192x192 SQUARE it was given (resize_with_pad letterboxes the image),
-        # not of the original image. The square's side corresponds to the
-        # image's longer edge, so both axes scale by that same length, and
-        # the padding added to the shorter axis is subtracted. Scaling x by
-        # width and y by height instead would squash every pose by the
-        # image's aspect ratio.
-        padded_size = max(original_width, original_height)
-        pad_x = (padded_size - original_width) / 2
-        pad_y = (padded_size - original_height) / 2
+    # Output shape [1, 6, 56]: per person, 17 keypoints as (y, x, confidence),
+    # then a bounding box (4 numbers) and an overall score
+    people = movenet(input_image)['output_0'].numpy()[0]
+
+    # Keypoint coordinates come back as fractions (0-1) of the PADDED input.
+    # Convert to pixels of the padded input, then scale up to the original
+    # image. Both axes use the same scale factor apart from rounding, so the
+    # pose keeps its true proportions whatever the image's shape.
+    x_scale = sizes['padded_width'] * sizes['original_width'] / sizes['resized_width']
+    y_scale = sizes['padded_height'] * sizes['original_height'] / sizes['resized_height']
+
+    best_keypoints = None
+    best_area = -1
+    for person in people:
+        if person[55] < MIN_POSE_SCORE:
+            continue
         keypoints = []
         for i, name in enumerate(KEYPOINT_NAMES):
-            y, x, confidence = keypoints_with_scores[i]
+            y, x, confidence = person[i * 3: i * 3 + 3]
             keypoints.append({
                 'name': name,
-                'x': float(x * padded_size - pad_x),   # original image pixels
-                'y': float(y * padded_size - pad_y),
+                'x': float(x * x_scale),   # original image pixels
+                'y': float(y * y_scale),
                 'confidence': float(confidence)
             })
+        box = compute_bounding_box(keypoints)
+        if box['x_min'] == float('inf'):
+            continue  # no confident keypoints at all
+        area = (box['x_max'] - box['x_min']) * (box['y_max'] - box['y_min'])
+        if area > best_area:
+            best_area = area
+            best_keypoints = keypoints
 
-        return keypoints
-
-    except Exception as e:
-        print(f"  Error processing {image_path}: {e}")
-        return None
+    return best_keypoints
 
 
 def save_resized_image(source_path, output_path):
@@ -290,8 +336,13 @@ def process_all_images():
         # Extract Object_ID from filename (assumes format: object_id.jpg)
         object_id = os.path.splitext(filename)[0]
 
-        # Detect pose
-        keypoints = detect_pose(movenet, image_path)
+        # Detect pose (None = no person found)
+        try:
+            keypoints = detect_pose(movenet, image_path)
+        except Exception as e:
+            print(f"  Error processing {image_path}: {e}")
+            failed_count += 1
+            continue
         processed_count += 1
 
         # Check if valid pose
@@ -332,8 +383,6 @@ def process_all_images():
             }
             output_metadata.append(output_record)
 
-        elif keypoints is None:
-            failed_count += 1
 
     # Save output metadata
     print(f"\nSaving metadata to {OUTPUT_METADATA_FILE}...")
@@ -346,8 +395,8 @@ def process_all_images():
     print("=" * 50)
     print(f"Total images processed: {processed_count}")
     print(f"Images with valid poses: {valid_pose_count}")
-    print(f"Images without valid poses: {processed_count - valid_pose_count - failed_count}")
-    print(f"Images that failed to load: {failed_count}")
+    print(f"Images without valid poses: {processed_count - valid_pose_count}")
+    print(f"Images that could not be read: {failed_count}")
     print(f"\nOutput saved to:")
     print(f"  - Images: {OUTPUT_IMAGES_FOLDER}/")
     print(f"  - Metadata: {OUTPUT_METADATA_FILE}")
